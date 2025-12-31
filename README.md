@@ -19,7 +19,13 @@ The analysis pipeline includes:
   - CoxBoost
   - Random Survival Forest (RSF)
 - Model evaluation using concordance-based metrics (e.g., C-index)
-- Permutation-based feature importance and stability analysis across multiple splits
+- Permutation-based feature importance and sensitivity analysis across multiple splits
 - Post hoc correlation analysis among top-ranked features
 
-  
+## Key Results
+
+### Univariate Cox-PH Screening
+The volcano plot summarizes genome-wide univariate Cox-PH models adjusted for age and gender,
+highlighting genes significantly associated with overall survival after FDR correction.
+
+![Volcano Plot](results/figures/unicox_volcano.png)
