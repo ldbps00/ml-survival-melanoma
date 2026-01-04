@@ -9,7 +9,7 @@ The goal is to compare multiple survival modeling approaches under the same data
 ## Methods
 
 ### Data Source and Cohort
-Individual-level RNA-seq, clinical, and pathological data were obtained from the TCGA melanoma project. The analysis focused on metastatic melanoma cases with complete survival outcomes, gene expression profiles, and key pathological features. After applying inclusion criteria, the final analytic cohort consisted of 237 patients.
+Individual-level RNA-seq, clinical, and pathological data were obtained from the TCGA. The analysis focused on metastatic melanoma cases with complete survival outcomes, gene expression profiles, and key pathological features. After applying inclusion criteria, the final analytic cohort consisted of 237 patients.
 
 ### Features and Preprocessing
 Predictors included normalized expression levels of ~20,500 genes from bulk RNA-seq and a set of clinical and pathological variables (age at diagnosis, gender, lymphocyte score, necrosis percentage, pigment score, and total mutation count).
