@@ -1,0 +1,837 @@
+---
+title: "Machine Learning–Based Survival Prediction in Metastatic Melanoma"
+author: "Xiaotong Zhao"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: readable
+    code_folding: show
+---
+
+## Project Overview
+
+This project develops and evaluates machine learning–based survival models to predict overall survival in metastatic melanoma patients by integrating high-dimensional RNA-sequencing data with pathological and clinical features.
+
+Using individual-level data from The Cancer Genome Atlas (TCGA), the analysis focuses on a cohort of 237 metastatic melanoma patients with complete survival, molecular, and pathological annotations. Three ML-based survival modeling approaches are compared: LASSO-penalized Cox regression, CoxBoost, and Random Survival Forest (RSF).
+
+The modeling pipeline emphasizes feature selection stability and predictive robustness under high-dimensional settings. Candidate prognostic biomarkers are identified based on permutation importance, with robustness assessed through repeated random train–test splits. Top-ranked features are further evaluated using Kaplan–Meier analysis and multivariable Cox proportional hazards models adjusted for age and gender.
+
+Model performance is assessed using the inverse probability of censoring weighted concordance index (C-IPCW). The project highlights both established clinical predictors, such as age at diagnosis, and potential novel molecular biomarkers, including NXT2, that may warrant further biological validation.
+
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load required libraries for survival modeling and visualization
+library(survival)
+library(survAUC)
+library(randomForestSRC)
+library(ggplot2)
+library(caret)
+library(CoxBoost)
+library(glmnet)
+library(survcomp)
+library(Matrix)
+library(ComplexHeatmap)
+library(circlize)
+
+```
+
+## Data Preprocessing and Feature Construction
+
+```{r load-and-preprocess, message=FALSE, warning=FALSE}
+# -----------------------------
+# Data loading & preprocessing
+# -----------------------------
+# (Optional) clean environment for reproducibility
+#rm(list = ls())
+
+# Read data
+rna_path  <- file.path("data", "raw", "melanoma_normalized.txt")
+clin_path <- file.path("data", "raw", "melanoma_clinical.csv")
+stopifnot(file.exists(rna_path), file.exists(clin_path))
+
+# RNA-seq matrix
+expr_raw <- read.table(rna_path, sep = "\t", quote = "", header = TRUE, check.names = FALSE)
+expr_raw <- expr_raw[-1, , drop = FALSE]  # remove extra header
+
+# Extract gene symbol before "|" and remove invalid entries
+gene_id <- as.character(expr_raw[, 1])
+gene <- vapply(strsplit(gene_id, "|", fixed = TRUE), `[`, character(1), 1)
+
+keep <- gene != "?"
+expr_raw <- expr_raw[keep, , drop = FALSE]
+gene <- gene[keep]
+
+# Remove known problematic gene
+keep <- gene != "SLC35E2"
+expr_raw <- expr_raw[keep, , drop = FALSE]
+gene <- gene[keep]
+
+rownames(expr_raw) <- gene
+expr_raw <- expr_raw[, -1, drop = FALSE]  # drop gene-id column
+
+# Convert to numeric matrix + log transform
+expr_mat <- apply(expr_raw, 2, as.numeric)
+rownames(expr_mat) <- gene
+expr_mat <- log10(expr_mat + 1)
+
+# Transform sample IDs: TCGA-XX-XXXX-YY 
+colnames(expr_mat) <- gsub(".", "-", colnames(expr_mat), fixed = TRUE)
+
+sam <- vapply(colnames(expr_mat), function(x) {
+  parts <- strsplit(x, "-")[[1]]
+  # parts[4] like "06A" -> "06"
+  s4 <- parts[4]
+  s4 <- substr(s4, 1, nchar(s4) - 1)
+  paste0(parts[1], "-", parts[2], "-", parts[3], "-", s4)
+}, character(1))
+
+colnames(expr_mat) <- sam
+
+# Keep metastatic samples only (label == "06")
+label <- vapply(strsplit(colnames(expr_mat), "-"), `[`, character(1), 4)
+expr_mat <- expr_mat[, label == "06", drop = FALSE]
+
+# Transpose: samples x genes
+expr_df <- as.data.frame(t(expr_mat))
+expr_df$Name <- rownames(expr_df)
+
+# Load clinical data
+info <- read.csv(clin_path, quote = "", header = TRUE, stringsAsFactors = FALSE)
+
+# Align clinical rows to expression samples
+aligned_info <- info[match(expr_df$Name, info$Name), ]
+result <- aligned_info[, c(
+  "Name",
+  "CURATED_DAYS_TO_DEATH_OR_LAST_FU",
+  "CURATED_VITAL_STATUS",
+  "LYMPHOCYTE.SCORE",
+  "PIGMENT.SCORE",
+  "NECROSIS",
+  "GENDER",
+  "TOTAL.MUTATIONS",
+  "CURATED_AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS"
+)]
+
+# Clean numeric fields
+cols_to_clean <- c("LYMPHOCYTE.SCORE", "PIGMENT.SCORE", "NECROSIS", "TOTAL.MUTATIONS")
+result[cols_to_clean] <- lapply(result[cols_to_clean], function(x) {
+  x[x == "-"] <- NA
+  as.numeric(x)
+})
+
+# Remove rows without valid survival outcomes
+bad_surv <- result$CURATED_DAYS_TO_DEATH_OR_LAST_FU %in% c("-", "[Not Available]", "[Discrepancy]") |
+            result$CURATED_VITAL_STATUS %in% c("-", "[Not Available]", "[Discrepancy]")
+result <- result[!bad_surv, , drop = FALSE]
+
+# Recode variables
+result$GENDER <- ifelse(result$GENDER == "MALE", 1,
+                       ifelse(result$GENDER == "FEMALE", 0, NA))
+
+result$CURATED_VITAL_STATUS <- ifelse(result$CURATED_VITAL_STATUS == "Dead", 1,
+                                      ifelse(result$CURATED_VITAL_STATUS == "Alive", 0, NA))
+
+result$CURATED_DAYS_TO_DEATH_OR_LAST_FU <- as.numeric(result$CURATED_DAYS_TO_DEATH_OR_LAST_FU) / 365
+
+# Drop incomplete cases
+result <- na.omit(result)
+
+# Merge clinical + expression (samples x features)
+data_combined <- merge(result, expr_df, by = "Name")
+
+# ---- Transformation & standardization ----
+
+data_combined$LYMPHOCYTE.SCORE =
+  scale(as.numeric(data_combined$LYMPHOCYTE.SCORE))
+data_combined$CURATED_AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS =
+  scale(as.numeric(data_combined$CURATED_AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS))
+
+# Highly skewed variables: log1p + z-score
+data_combined$PIGMENT.SCORE =
+  scale(log1p(data_combined$PIGMENT.SCORE))
+data_combined$NECROSIS =
+  scale(log1p(data_combined$NECROSIS))
+data_combined$TOTAL.MUTATIONS =
+  scale(log1p(data_combined$TOTAL.MUTATIONS))
+
+# Quick sanity checks
+dim(data_combined)
+head(data_combined[, 1:10])
+```
+
+## Univariable Cox-PH model Adjusting for Age and Sex
+
+```{r unicox-run, cache=TRUE, message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# Univariate Cox proportional hazards screening
+# Adjusted for age at diagnosis and gender
+# ------------------------------------------------------------
+
+# Define survival outcome (time-to-event and censoring)
+surv_obj <- Surv(
+  time  = data_combined$CURATED_DAYS_TO_DEATH_OR_LAST_FU,
+  event = data_combined$CURATED_VITAL_STATUS
+)
+
+# Extract adjustment covariates
+gender <- as.factor(data_combined$GENDER)
+age    <- data_combined$CURATED_AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS
+
+# Initialize results container
+results_unicox <- data.frame(
+  Gene    = character(),
+  HR      = numeric(),
+  p.value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Fit univariate Cox-PH model for each genefor (gene_name in colnames(gene_data)) {
+# Model: Surv(time, event) ~ gene_expression + age + gender
+for (gene_name in colnames(gene_data)) {
+
+  gene_expr <- gene_data[[gene_name]]
+
+  # Skip genes with zero variance
+  if (var(gene_expr, na.rm = TRUE) > 0) {
+
+    fit <- try(
+      coxph(surv_obj ~ gene_expr + age + gender),
+      silent = TRUE
+    )
+
+    if (!inherits(fit, "try-error")) {
+
+      coef_summary <- summary(fit)$coefficients
+
+      results_unicox <- rbind(
+        results_unicox,
+        data.frame(
+          Gene    = gene_name,
+          HR      = exp(coef_summary["gene_expr", "coef"]),
+          p.value = coef_summary["gene_expr", "Pr(>|z|)"]
+        )
+      )
+    }
+  }
+}
+
+# Multiple testing correction (Benjamini–Hochberg FDR)
+results_unicox$p.adj <- p.adjust(results_unicox$p.value, method = "fdr")
+
+# Inspect top-ranked genes
+head(results_unicox)
+
+# ------------------------------------------------------------
+# Save results for downstream visualization and reproducibility
+# ------------------------------------------------------------
+saveRDS(
+  results_unicox,
+  file = file.path("results", "tables", "univariate_cox_results.rds")
+)
+```
+
+## Volcano Plot and Forest Plot for Univariate Cox-PH results
+
+#Volcano plot
+```{r unicox-volcano, message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# Visualization: Volcano plot (Univariate Cox-PH screening)
+# ------------------------------------------------------------
+
+stopifnot(exists("results_unicox"))
+
+volcano_data <- within(results_unicox, {
+  logHR     <- log2(HR)
+  negLogFDR <- -log10(p.adj)
+  Significance <- ifelse(p.adj < 0.05, "Significant", "Not Significant")
+})
+
+p_volcano <- ggplot(volcano_data, aes(x = logHR, y = negLogFDR)) +
+  geom_point(aes(color = Significance), alpha = 0.6, size = 1.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted", color = "red") +
+  scale_color_manual(values = c("Significant" = "firebrick", "Not Significant" = "gray")) +
+  coord_cartesian(xlim = c(-4, 4)) +
+  labs(
+    title = "Univariate Cox-PH Screening (Adjusted for Age and Gender)",
+    x = "log2(Hazard Ratio)",
+    y = "-log10(FDR-adjusted p-value)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p_volcano)
+
+# Report number of significant genes
+num_sig <- sum(volcano_data$p.adj < 0.05, na.rm = TRUE)
+cat("Number of significant genes at FDR < 0.05:", num_sig, "\n")
+
+# Save outputs (GitHub-friendly)
+dir.create(file.path("results", "figures"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path("results", "tables"),  recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  filename = file.path("results", "figures", "unicox_volcano.png"),
+  plot = p_volcano, width = 7.5, height = 5.5, dpi = 300
+)
+
+write.csv(
+  volcano_data,
+  file = file.path("results", "tables", "unicox_volcano_data.csv"),
+  row.names = FALSE
+)
+
+```
+
+#forest plot
+```{r unicox-forest, message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# Visualization: Forest plot (Top 10 genes by FDR)
+# Cox-PH models adjusted for age and gender
+# ------------------------------------------------------------
+
+stopifnot(exists("results_unicox"), exists("data_combined"))
+
+# Filter extreme/invalid HRs first (optional but practical)
+filtered_unicox <- subset(
+  results_unicox,
+  is.finite(HR) & HR > 0.05 & HR < 20
+)
+
+top_genes <- head(filtered_unicox[order(filtered_unicox$p.adj), ], 10)
+
+# Fit adjusted Cox model for each top gene to extract HR + 95% CI
+forest_data <- do.call(rbind, lapply(top_genes$Gene, function(g) {
+
+  gene_expr <- data_combined[[g]]
+  age       <- data_combined$CURATED_AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS
+  gender    <- as.factor(data_combined$GENDER)
+
+  surv_obj <- Surv(
+    data_combined$CURATED_DAYS_TO_DEATH_OR_LAST_FU,
+    data_combined$CURATED_VITAL_STATUS
+  )
+
+  fit <- coxph(surv_obj ~ gene_expr + age + gender)
+  s   <- summary(fit)
+
+  hr    <- s$conf.int["gene_expr", "exp(coef)"]
+  lower <- s$conf.int["gene_expr", "lower .95"]
+  upper <- s$conf.int["gene_expr", "upper .95"]
+
+  data.frame(
+    Gene = g,
+    HR = hr,
+    Lower = lower,
+    Upper = upper,
+    logHR = log(hr),
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Safety filter (optional)
+forest_data <- subset(
+  forest_data,
+  HR >= 0.05 & HR <= 20 & Lower >= 0 & Upper <= 50
+)
+
+forest_data <- forest_data[order(forest_data$HR), ]
+
+p_forest <- ggplot(forest_data, aes(x = HR, y = reorder(Gene, HR))) +
+  geom_point(aes(size = abs(logHR), shape = HR < 1), color = "black") +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.2, color = "black") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray40") +
+  scale_shape_manual(values = c(`TRUE` = 17, `FALSE` = 16)) +
+  scale_x_log10(
+    limits = c(0.01, 20),
+    breaks = c(0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20),
+    labels = c("0.01", "0.05", "0.1", "0.5", "1", "2", "5", "10", "20")
+  ) +
+  labs(
+    title = "Top 10 Genes from Univariate Cox-PH Screening",
+    subtitle = "Adjusted for age at diagnosis and gender",
+    x = "Hazard Ratio (95% CI)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line.x = element_line(color = "black"),
+    axis.line.y = element_blank(),
+    plot.title = element_text(size = 15, face = "bold")
+  ) +
+  guides(size = "none", shape = "none")
+
+print(p_forest)
+
+# Save outputs
+dir.create(file.path("results", "figures"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path("results", "tables"),  recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  filename = file.path("results", "figures", "unicox_forest_top10.png"),
+  plot = p_forest, width = 7.5, height = 5, dpi = 300
+)
+
+write.csv(
+  forest_data,
+  file = file.path("results", "tables", "unicox_forest_top10.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+## Random Survival Forest (RSF)
+
+```{r rsf-cv, message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# Random Survival Forest (RSF): 5-fold CV + C-index + variable importance
+# ------------------------------------------------------------
+
+set.seed(169)
+
+# Survival object
+surv_obj <- with(
+  data_combined,
+  Surv(CURATED_DAYS_TO_DEATH_OR_LAST_FU, CURATED_VITAL_STATUS)
+)
+
+# Feature matrix 
+x <- data_combined[, !(names(data_combined) %in% c(
+  "Name", "CURATED_DAYS_TO_DEATH_OR_LAST_FU", "CURATED_VITAL_STATUS"
+)), drop = FALSE]
+
+# Build a modeling data frame 
+df_rsf <- cbind(SurvObj = surv_obj, x)
+
+# 5-fold CV splits (createFolds returns TRAIN indices by default)
+folds_train <- createFolds(data_combined$CURATED_VITAL_STATUS, k = 5, returnTrain = TRUE)
+
+c_indexes <- numeric(length(folds_train))
+importance_list <- vector("list", length(folds_train))
+
+for (i in seq_along(folds_train)) {
+
+  train_idx <- folds_train[[i]]
+  test_idx  <- setdiff(seq_len(nrow(df_rsf)), train_idx)
+
+  train_df <- df_rsf[train_idx, , drop = FALSE]
+  test_df  <- df_rsf[test_idx,  , drop = FALSE]
+
+  # Fit RSF on training fold
+  rsf_model <- rfsrc(
+    SurvObj ~ .,
+    data = train_df,
+    ntree = 500,
+    mtry = min(200, ncol(train_df) - 1),   # safety: cannot exceed #features
+    nodesize = 15,
+    importance = "permute"
+  )
+
+  # Predict on test fold
+  rsf_pred <- predict(rsf_model, newdata = test_df)
+
+  # C-index on test fold (using predicted risk)
+  risk_score <- rsf_pred$predicted
+  true_surv  <- test_df$SurvObj
+
+  c_indexes[i] <- survConcordance(true_surv ~ risk_score)$concordance
+
+  # Store permutation importance
+  importance_list[[i]] <- rsf_model$importance
+}
+
+# Summary of CV performance
+cat("RSF 5-fold C-indexes:\n")
+print(c_indexes)
+cat("Mean C-index:", mean(c_indexes, na.rm = TRUE), "\n")
+
+# Average permutation importance across folds
+importance_mat <- do.call(cbind, importance_list)
+mean_importance <- rowMeans(importance_mat, na.rm = TRUE)
+
+importance_df <- data.frame(
+  Feature = names(mean_importance),
+  PermutationImportance = as.numeric(mean_importance),
+  stringsAsFactors = FALSE
+)
+
+top10_importance <- head(importance_df[order(-importance_df$PermutationImportance), ], 10)
+top10_importance
+
+# Save outputs
+dir.create(file.path("results", "tables"), recursive = TRUE, showWarnings = FALSE)
+
+write.csv(
+  data.frame(Fold = seq_along(c_indexes), C_index = c_indexes),
+  file = file.path("results", "tables", "rsf_cindex_5fold.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  top10_importance,
+  file = file.path("results", "tables", "rsf_top10_importance.csv"),
+  row.names = FALSE
+)
+```
+
+
+## Coxboost
+```{r coxboost-cv, message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# CoxBoost: 5-fold CV with Uno's C-index + permutation importance
+# ------------------------------------------------------------
+set.seed(190)
+
+# Survival outcome
+y_time   <- data_combined$CURATED_DAYS_TO_DEATH_OR_LAST_FU
+y_status <- data_combined$CURATED_VITAL_STATUS
+
+# Feature matrix: drop identifiers and survival outcomes
+features <- data_combined[, !(names(data_combined) %in% c(
+  "Name", "CURATED_DAYS_TO_DEATH_OR_LAST_FU", "CURATED_VITAL_STATUS"
+)), drop = FALSE]
+
+# Ensure numeric matrix for CoxBoost
+features <- data.frame(lapply(features, function(x) {
+  if (is.factor(x) || is.character(x)) as.numeric(as.factor(x)) else as.numeric(x)
+}))
+x <- as.matrix(features)
+
+n <- nrow(x)
+
+# 5-fold CV assignment (balanced + reproducible)
+fold_id <- sample(rep(1:5, length.out = n))
+
+cindex_vec <- numeric(5)
+perm_matrix <- matrix(NA_real_, nrow = 5, ncol = ncol(x))
+colnames(perm_matrix) <- colnames(x)
+
+for (k in 1:5) {
+
+  train_idx <- which(fold_id != k)
+  test_idx  <- which(fold_id == k)
+
+  x_train <- x[train_idx, , drop = FALSE]
+  x_test  <- x[test_idx,  , drop = FALSE]
+
+  surv_train <- Surv(y_time[train_idx], y_status[train_idx])
+  surv_test  <- Surv(y_time[test_idx],  y_status[test_idx])
+
+  # Fit CoxBoost model
+  model <- CoxBoost(
+    time    = y_time[train_idx],
+    status  = y_status[train_idx],
+    x       = x_train,
+    stepno  = 200,
+    penalty = 250
+  )
+
+  # Baseline prediction and Uno's C-index on test fold
+  lp_test <- predict(model, newdata = x_test, type = "lp")
+
+  baseline_cindex <- UnoC(
+    Surv.rsp     = surv_train,
+    Surv.rsp.new = surv_test,
+    lpnew        = lp_test
+  )
+
+  cindex_vec[k] <- baseline_cindex
+
+  # Permutation importance 
+  perm_imp <- numeric(ncol(x_test))
+  names(perm_imp) <- colnames(x_test)
+
+  for (j in seq_len(ncol(x_test))) {
+    x_perm <- x_test
+    x_perm[, j] <- sample(x_perm[, j])
+
+    lp_perm <- predict(model, newdata = x_perm, type = "lp")
+
+    perm_cindex <- UnoC(
+      Surv.rsp     = surv_train,
+      Surv.rsp.new = surv_test,
+      lpnew        = lp_perm
+    )
+
+    perm_imp[j] <- baseline_cindex - perm_cindex
+  }
+
+  perm_matrix[k, ] <- perm_imp
+}
+
+# CV performance summary
+cat("CoxBoost 5-fold Uno's C-index:\n")
+print(round(cindex_vec, 4))
+cat("Mean Uno's C-index:", round(mean(cindex_vec, na.rm = TRUE), 4), "\n")
+
+# Average permutation importance across folds
+perm_avg <- colMeans(perm_matrix, na.rm = TRUE)
+top10 <- head(sort(perm_avg, decreasing = TRUE), 10)
+
+cat("\nTop 10 important features (mean drop in Uno's C-index):\n")
+print(round(top10, 4))
+
+# Save outputs (GitHub-friendly)
+dir.create(file.path("results", "tables"), recursive = TRUE, showWarnings = FALSE)
+
+write.csv(
+  data.frame(Fold = 1:5, UnoC = cindex_vec),
+  file = file.path("results", "tables", "coxboost_unoc_5fold.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(Feature = names(perm_avg), PermutationImportance = as.numeric(perm_avg)),
+  file = file.path("results", "tables", "coxboost_perm_importance_all.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(Feature = names(top10), PermutationImportance = as.numeric(top10)),
+  file = file.path("results", "tables", "coxboost_top10_importance.csv"),
+  row.names = FALSE
+)
+```
+
+
+## lasso-Cox
+```{r lasso-cox-cv, message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# LASSO-penalized Cox regression: 5-fold CV + C-index + permutation importance
+# ------------------------------------------------------------
+
+
+set.seed(123)
+
+# Filter invalid survival time
+df <- data_combined[data_combined$CURATED_DAYS_TO_DEATH_OR_LAST_FU > 0, , drop = FALSE]
+
+# Survival outcome
+y_all <- with(df, Surv(CURATED_DAYS_TO_DEATH_OR_LAST_FU, CURATED_VITAL_STATUS))
+
+# Features: drop identifiers and survival outcomes
+features <- df[, !(names(df) %in% c("Name", "CURATED_DAYS_TO_DEATH_OR_LAST_FU", "CURATED_VITAL_STATUS")), drop = FALSE]
+
+# Robust design matrix
+# Use "-1" to avoid intercept; LASSO doesn't need it for Cox
+x_all <- model.matrix(~ . - 1, data = features)
+
+# Outer 5-fold CV splits
+folds_train <- createFolds(df$CURATED_VITAL_STATUS, k = 5, returnTrain = TRUE)
+
+c_indexes   <- numeric(length(folds_train))
+best_model  <- NULL
+best_lambda <- NA_real_
+best_fold   <- NA_integer_
+best_x_test <- NULL
+best_y_test <- NULL
+
+for (i in seq_along(folds_train)) {
+
+  train_idx <- folds_train[[i]]
+  test_idx  <- setdiff(seq_len(nrow(df)), train_idx)
+
+  x_train <- x_all[train_idx, , drop = FALSE]
+  y_train <- y_all[train_idx]
+
+  x_test <- x_all[test_idx, , drop = FALSE]
+  y_test <- y_all[test_idx]
+
+  # Inner CV to choose lambda on training fold
+  cv_fit <- cv.glmnet(
+    x_train, y_train,
+    family  = "cox",
+    alpha   = 1,
+    nfolds  = 5
+  )
+
+  lambda <- cv_fit$lambda.min
+
+  # Fit final LASSO Cox on training fold using chosen lambda
+  model <- glmnet(
+    x_train, y_train,
+    family = "cox",
+    alpha  = 1,
+    lambda = lambda
+  )
+
+  # Predict risk score on test fold
+  risk_score <- as.numeric(predict(model, newx = x_test, type = "link"))
+
+  # Compute C-index on test fold
+  c_idx <- concordance.index(
+    x         = risk_score,
+    surv.time = y_test[, 1],
+    surv.event= y_test[, 2]
+  )$c.index
+
+  c_indexes[i] <- c_idx
+
+  # Track best-performing fold/model
+  if (is.null(best_model) || c_idx > max(c_indexes[1:(i-1)], na.rm = TRUE)) {
+    best_model  <- model
+    best_lambda <- lambda
+    best_fold   <- i
+    best_x_test <- x_test
+    best_y_test <- y_test
+  }
+}
+
+cat("LASSO-Cox 5-fold C-indexes:\n")
+print(round(c_indexes, 4))
+cat("Mean C-index:", round(mean(c_indexes, na.rm = TRUE), 4), "\n")
+cat("Best model from Fold", best_fold, "with lambda =", best_lambda,
+    "and C-index =", round(max(c_indexes, na.rm = TRUE), 4), "\n")
+
+# ------------------------------------------------------------
+# Permutation importance on the best fold (drop in C-index)
+# ------------------------------------------------------------
+perm_importance <- data.frame(
+  Feature = colnames(best_x_test),
+  DropCIndex = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+base_score  <- as.numeric(predict(best_model, newx = best_x_test, type = "link"))
+base_cindex <- concordance.index(
+  x          = base_score,
+  surv.time  = best_y_test[, 1],
+  surv.event = best_y_test[, 2]
+)$c.index
+
+for (j in seq_len(ncol(best_x_test))) {
+  perm_x <- best_x_test
+  perm_x[, j] <- sample(perm_x[, j])
+
+  perm_score <- as.numeric(predict(best_model, newx = perm_x, type = "link"))
+
+  perm_cidx <- concordance.index(
+    x          = perm_score,
+    surv.time  = best_y_test[, 1],
+    surv.event = best_y_test[, 2]
+  )$c.index
+
+  perm_importance$DropCIndex[j] <- base_cindex - perm_cidx
+}
+
+top10 <- head(perm_importance[order(-perm_importance$DropCIndex), ], 10)
+cat("\nTop 10 features by permutation importance (best fold):\n")
+print(top10)
+
+# Save outputs
+dir.create(file.path("results", "tables"), recursive = TRUE, showWarnings = FALSE)
+
+write.csv(
+  data.frame(Fold = seq_along(c_indexes), C_index = c_indexes),
+  file = file.path("results", "tables", "lasso_cox_cindex_5fold.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  top10,
+  file = file.path("results", "tables", "lasso_cox_top10_perm_importance.csv"),
+  row.names = FALSE
+)
+```
+
+## Correlation heatmap among top features identified by any model
+```{r feature-correlation-heatmap, message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# Correlation heatmap among top features identified by any model
+# (CoxBoost / RSF / LASSO-Cox)
+# ------------------------------------------------------------
+
+# ---- Feature lists from each model ----
+coxboost_features <- c(
+  "HIST1H4A", "LHFPL5", "FAM184A", "NXT2", "AGE_AT_DIAGNOSIS",
+  "LOC143666", "NUDT9P1", "NCRNA00167", "KRTAP4.1", "ZDHHC13",
+  "TMC2", "KLHDC2", "C12orf5", "SCCPDH", "CECR7",
+  "PATE4", "CDRT15", "FLJ39609"
+)
+
+rsf_features <- c(
+  "AGE_AT_DIAGNOSIS", "HMOX2", "NCRNA00093", "OR8D2", "INSR",
+  "TXNL4A", "EPS8L1", "NXT2", "PCA3"
+)
+
+lasso_features <- c(
+  "AGE_AT_DIAGNOSIS", "HIST1H4A", "KLHDC2", "FAM184A", "ZDHHC13",
+  "SKP2", "NXT2", "HCP5", "TCEB3", "GRWD1"
+)
+
+all_features <- unique(c(coxboost_features, rsf_features, lasso_features))
+
+# ---- Robust name matching (handles dots, hyphens, etc.) ----
+clean_name <- function(x) gsub("[^A-Za-z0-9]", "", toupper(x))
+
+# Create a local alias so we don't modify data_combined globally
+data_cols <- colnames(data_combined)
+
+# Map "AGE_AT_DIAGNOSIS" to the actual column name in your dataset (if needed)
+# Your original column is CURATED_AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS
+data_cols_alias <- data_cols
+data_cols_alias[data_cols_alias == "CURATED_AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS"] <- "AGE_AT_DIAGNOSIS"
+
+cleaned_data_cols <- clean_name(data_cols_alias)
+cleaned_feature_names <- clean_name(all_features)
+
+matched_idx <- which(cleaned_data_cols %in% cleaned_feature_names)
+matched_cols <- data_cols[matched_idx]               # actual column names from data_combined
+matched_alias <- data_cols_alias[matched_idx]        # display names (AGE_AT_DIAGNOSIS etc.)
+
+# Report matching status (GitHub-friendly)
+missing_features <- all_features[!(clean_name(all_features) %in% cleaned_data_cols)]
+cat("Matched features:", length(matched_cols), "out of", length(all_features), "\n")
+if (length(missing_features) > 0) {
+  cat("Not found in data_combined (after cleaning):\n")
+  print(missing_features)
+}
+
+stopifnot(length(matched_cols) > 1)
+
+# Build numeric matrix
+mat <- data_combined[, matched_cols, drop = FALSE]
+mat <- as.data.frame(lapply(mat, function(x) as.numeric(as.character(x))))
+mat <- as.matrix(mat)
+
+# Rename columns for display
+colnames(mat) <- matched_alias
+
+# Pearson correlation
+cor_matrix <- cor(mat, method = "pearson", use = "pairwise.complete.obs")
+
+# Plot
+col_fun <- circlize::colorRamp2(c(-1, 0, 1), c("#2166AC", "white", "#B2182B"))
+
+show_numbers <- ncol(cor_matrix) <= 20
+
+dir.create(file.path("results", "figures"), recursive = TRUE, showWarnings = FALSE)
+png(file.path("results", "figures", "feature_correlation_heatmap.png"),
+    width = 1200, height = 1000, res = 150)
+
+Heatmap(
+  cor_matrix,
+  name = "Correlation",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  row_names_side = "left",
+  column_names_side = "bottom",
+  column_names_rot = 45,
+  column_title = "Correlation Heatmap of Features Identified by Any Model",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+  cell_fun = if (show_numbers) {
+    function(j, i, x, y, width, height, fill) {
+      grid.text(sprintf("%.2f", cor_matrix[i, j]), x, y, gp = gpar(fontsize = 7))
+    }
+  } else NULL
+)
+```
