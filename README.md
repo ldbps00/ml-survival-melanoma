@@ -39,22 +39,22 @@ For features consistently identified across models, correlations among predictor
 
 ## Key Results
 
-### Univariate Cox-PH Analysis of Gene Expression and Survival.
+### Figure 1. Univariate Cox-PH Analysis of Gene Expression and Survival.
 (a) Volcano plot of genome-wide univariate Cox models (~20,500 genes), showing effect size (log₂ hazard ratio) versus statistical significance (−log₁₀ FDR). Genes passing the FDR < 0.05 threshold are highlighted.
 (b) Forest plot of the top 20 survival-associated genes ranked by statistical significance, with hazard ratios and 95% confidence intervals.
 
 ![Volcano Plot and Forest Plot](results/figures/Figure1_UnivariateCoxPH.png)
 
-### Comparison of Model Performance on Metastatic Melanoma Survival Prediction.
+### Figure 2. Comparison of Model Performance on Metastatic Melanoma Survival Prediction.
 
 ![ML Model Performance](results/figures/Figure2_ModelPerformance.png)
 
-### Key Prognostic Features Identified by Three ML Models.
+### Figure 3. Key Prognostic Features Identified by Three ML Models.
 (c) RSF.
 (d) Venn diagram showing the overlap of top features (selected ≥ 2 times) identified by CoxBoost, Lasso-Cox, and RSF. 
 ![Feature Importance](results/figures/Figure3_Keyfeatures.png)
 
-### Correlation Heatmap of Prognostic Features Identified by CoxBoost, LASSO-Cox, and Random Survival Forest
+### Figure 4. Correlation Heatmap of Prognostic Features Identified by CoxBoost, LASSO-Cox, and Random Survival Forest
 The heatmap displays the Pearson correlation coefficients among all features selected by at least one of the three survival models. Color intensity indicates the strength and direction of pairwise correlations, ranging from −1 (blue, strong negative correlation) to +1 (red, strong positive correlation).
 ![Correlation Heatmap](results/figures/Figure4_Heatmap.png)
 
