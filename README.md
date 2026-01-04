@@ -57,3 +57,7 @@ For features consistently identified across models, correlations among predictor
 ### Correlation Heatmap of Prognostic Features Identified by CoxBoost, LASSO-Cox, and Random Survival Forest
 The heatmap displays the Pearson correlation coefficients among all features selected by at least one of the three survival models. Color intensity indicates the strength and direction of pairwise correlations, ranging from −1 (blue, strong negative correlation) to +1 (red, strong positive correlation).
 ![Correlation Heatmap](results/figures/Figure4_Heatmap.png)
+
+## Key Results
+
+Machine learning–based survival modeling, especially CoxBoost, shows strong performance in predicting survival outcomes and identifying robust prognostic features in metastatic melanoma, emphasizing the importance of model comparison, stability analysis, and feature interpretability in high-dimensional biomedical data.
